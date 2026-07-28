@@ -2,6 +2,7 @@ from typing import Any
 from fastmcp import FastMCP, Context
 from pydantic import Field
 import os
+import shlex
 import subprocess
 from typing import Dict, Optional
 from cachetools import TTLCache
@@ -542,12 +543,11 @@ class KubectlHandler:
     def run_streaming_command(self, command: str, kubeconfig_path: str, timeout: int, execution_log: ExecutionLog) -> Dict[str, Any]:
         """运行流式命令，支持超时控制"""
         try:
-            full_command = f"kubectl --kubeconfig {kubeconfig_path} {command}"
+            cmd_list = ["kubectl", "--kubeconfig", kubeconfig_path] + shlex.split(command)
             
             cmd_start = int(time.time() * 1000)
             process = subprocess.Popen(
-                full_command,
-                shell=True,
+                cmd_list,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -635,12 +635,11 @@ class KubectlHandler:
     def run_command(self, command: str, kubeconfig_path: str, timeout: int, execution_log: ExecutionLog) -> Dict[str, Any]:
         """Run a kubectl command and return structured result."""
         try:
-            full_command = f"kubectl --kubeconfig {kubeconfig_path} {command}"
+            cmd_list = ["kubectl", "--kubeconfig", kubeconfig_path] + shlex.split(command)
             
             cmd_start = int(time.time() * 1000)
             result = subprocess.run(
-                full_command,
-                shell=True,
+                cmd_list,
                 capture_output=True,
                 text=True,
                 check=True,

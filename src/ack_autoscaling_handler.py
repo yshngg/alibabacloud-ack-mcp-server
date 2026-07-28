@@ -244,15 +244,11 @@ class ACKAutoscalingHandler:
                 execution_log,
             )
 
-            command = (
-                f"kubectl --kubeconfig {kubeconfig_path} "
-                f"get {workload_type} {workload_name} -n {namespace} -o json"
-            )
+            command = ["kubectl", "--kubeconfig", kubeconfig_path, "get", workload_type, workload_name, "-n", namespace, "-o", "json"]
 
             cmd_start = int(time.time() * 1000)
             result = subprocess.run(
                 command,
-                shell=True,
                 capture_output=True,
                 text=True,
                 timeout=self.kubectl_timeout,
@@ -860,12 +856,11 @@ class ACKAutoscalingHandler:
                 execution_log
             )
 
-            command = f"kubectl --kubeconfig {kubeconfig_path} get {workload_type} {workload_name} -n {namespace} -o json"
-            
+            command = ["kubectl", "--kubeconfig", kubeconfig_path, "get", workload_type, workload_name, "-n", namespace, "-o", "json"]
+
             cmd_start = int(time.time() * 1000)
             result = subprocess.run(
                 command,
-                shell=True,
                 capture_output=True,
                 text=True,
                 timeout=self.kubectl_timeout
