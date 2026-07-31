@@ -1,15 +1,137 @@
-from typing import Any
-from fastmcp import FastMCP, Context
-from pydantic import Field
 import os
+import re
+import shlex
 import subprocess
-from typing import Dict, Optional
-from cachetools import TTLCache
-from loguru import logger
-from ack_cluster_handler import parse_master_url
-from models import KubectlOutput, ExecutionLog, enable_execution_log_ctx
+import tempfile
 import time
 from datetime import datetime
+from typing import Any, Dict, Optional
+
+from cachetools import TTLCache
+from fastmcp import FastMCP, Context
+from loguru import logger
+from pydantic import Field
+
+from ack_cluster_handler import parse_master_url
+from models import KubectlOutput, ExecutionLog, enable_execution_log_ctx
+
+_K8S_NAME_RE = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')
+_SHELL_METACHARS = frozenset(';&|`$\\\n<>(){}[]\'"!*?#~')
+_READONLY_COMMANDS = frozenset({
+    "api-resources", "api-versions", "cluster-info", "describe",
+    "diff", "events", "explain", "get", "kustomize", "logs",
+    "options", "top", "version",
+})
+_FORBIDDEN_KUBECTL_FLAGS = frozenset({
+    '--kubeconfig', '--server', '--token', '--client-certificate', '--client-key',
+    '--as', '--as-group', '--user', '--cluster', '--context',
+    '--insecure-skip-tls-verify', '--raw',
+})
+_INTERACTIVE_FLAGS = frozenset({'-i', '-t', '--stdin', '--tty'})
+_WORKLOAD_TYPES = frozenset({'deployment', 'statefulset', 'daemonset', 'replicaset'})
+_FORBIDDEN_FLAGS_NORMALIZED = frozenset(f.lstrip('-') for f in _FORBIDDEN_KUBECTL_FLAGS)
+
+
+def validate_kubernetes_name(name: str, context: str = "resource") -> str:
+    if not name or not _K8S_NAME_RE.match(name):
+        raise ValueError(f"Invalid {context} name: {name}")
+    return name
+
+
+def validate_shell_safe_param(value: str, context: str = "parameter") -> str:
+    if not value:
+        raise ValueError(f"Empty {context}")
+    if any(c in _SHELL_METACHARS for c in value):
+        raise ValueError(f"Unsafe characters in {context}: {value}")
+    return value
+
+
+def validate_kubeconfig_path(path: str) -> str:
+    if not path:
+        raise ValueError("Empty kubeconfig path")
+    if any(c in _SHELL_METACHARS for c in path):
+        raise ValueError(f"Unsafe characters in kubeconfig path: {path}")
+    if '..' in os.path.normpath(path).split(os.sep):
+        raise ValueError(f"Path traversal detected in kubeconfig path: {path}")
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def validate_workload_type(workload_type: str) -> str:
+    normalized = workload_type.lower()
+    if normalized not in _WORKLOAD_TYPES:
+        raise ValueError(f"Invalid workload type: {workload_type}. Must be one of: {', '.join(sorted(_WORKLOAD_TYPES))}")
+    return normalized
+
+
+def _is_forbidden_flag(token: str) -> bool:
+    if not token.startswith('-'):
+        return False
+    normalized = token.lstrip('-').split('=', 1)[0]
+    return normalized in _FORBIDDEN_FLAGS_NORMALIZED
+
+
+def _is_interactive_flag(token: str) -> bool:
+    if token in _INTERACTIVE_FLAGS:
+        return True
+    if token.startswith('-') and not token.startswith('--') and 'i' in token and 't' in token:
+        return True
+    return False
+
+
+class KubectlRunner:
+    def __init__(self, kubeconfig_path: str, timeout: int = 30, allow_write: bool = False):
+        self._env = {**os.environ, "KUBECONFIG": kubeconfig_path}
+        self._timeout = timeout
+        self._allow_write = allow_write
+
+    def run(self, *args: str) -> dict[str, Any]:
+        tokens = list(args)
+        error = self._check_security(tokens)
+        if error:
+            return {"exit_code": 1, "stdout": "", "stderr": error}
+        try:
+            result = subprocess.run(["kubectl"] + tokens, shell=False,
+                                    capture_output=True, text=True,
+                                    timeout=self._timeout, env=self._env)
+            return {"exit_code": result.returncode,
+                    "stdout": result.stdout.strip() if result.stdout else "",
+                    "stderr": result.stderr.strip() if result.stderr else ""}
+        except subprocess.TimeoutExpired:
+            return {"exit_code": 124, "stdout": "", "stderr": f"timed out after {self._timeout}s"}
+        except FileNotFoundError:
+            return {"exit_code": 127, "stdout": "", "stderr": "kubectl not installed"}
+
+    def _check_security(self, tokens: list[str]) -> str | None:
+        return (self._check_forbidden_flags(tokens)
+                or self._check_interactive(tokens)
+                or (not self._allow_write and self._check_write(tokens)))
+
+    def _check_forbidden_flags(self, tokens: list[str]) -> str | None:
+        found = [t for t in tokens if _is_forbidden_flag(t)]
+        if found:
+            return f"Forbidden flag(s) not allowed: {', '.join(found)}"
+        return None
+
+    def _check_interactive(self, tokens: list[str]) -> str | None:
+        if not tokens:
+            return None
+        if tokens[0] == "port-forward":
+            return "interactive mode not supported for kubectl port-forward, please use service types like NodePort or LoadBalancer"
+        if tokens[0] == "edit":
+            return "interactive mode not supported for kubectl edit, please use 'kubectl get -o yaml', 'kubectl patch', or 'kubectl apply'"
+        if any(_is_interactive_flag(t) for t in tokens):
+            return "interactive mode not supported (commands with -it/-i/-t/--stdin/--tty flags), please use non-interactive commands"
+        return None
+
+    def _check_write(self, tokens: list[str]) -> str | None:
+        if not tokens:
+            return "Empty command not allowed"
+        if tokens[0] not in _READONLY_COMMANDS:
+            return f"Write command '{tokens[0]}' not allowed in read-only mode. Only read-only commands are permitted: {', '.join(sorted(_READONLY_COMMANDS))}"
+        return None
+
+
+_CLUSTER_ID_PATTERN = re.compile(r"^c[a-z0-9]{32}$")
 
 class KubectlContextManager(TTLCache):
     """基于 TTL+LRU 缓存的 kubeconfig 文件管理器"""
@@ -26,9 +148,7 @@ class KubectlContextManager(TTLCache):
         self._cs_client = None  # CS客户端实例
         self.do_not_cleanup_file = None  # 本地kubeconfig文件路径，不需要清理
 
-        # 使用 .kube 目录存储 kubeconfig 文件
-        self._kube_dir = os.path.expanduser("~/.kube")
-        os.makedirs(self._kube_dir, exist_ok=True)
+        self._kube_dir = tempfile.mkdtemp(prefix="mcp-kubeconfig-")
 
         self._setup_cleanup_handlers()
 
@@ -150,7 +270,8 @@ class KubectlContextManager(TTLCache):
         # 确保目录存在
         os.makedirs(os.path.dirname(kubeconfig_path), exist_ok=True)
 
-        with open(kubeconfig_path, 'w') as f:
+        fd = os.open(kubeconfig_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
             f.write(kubeconfig_content)
 
         # 添加到缓存
@@ -164,7 +285,7 @@ class KubectlContextManager(TTLCache):
         if path and os.path.exists(path):
             if self.do_not_cleanup_file and os.path.samefile(path, self.do_not_cleanup_file):
                 logger.debug(f"Skipped removal of protected kubeconfig file: {path}")
-                return
+                return key, path
             try:
                 os.remove(path)
                 logger.debug(f"Removed cached kubeconfig file: {path}")
@@ -342,7 +463,8 @@ class KubectlContextManager(TTLCache):
             raise ValueError("unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined")
         
         kubeconfig_path = os.path.join(self._kube_dir, "config.incluster")
-        with open(kubeconfig_path, 'w') as f:
+        fd = os.open(kubeconfig_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
             f.write(f"""apiVersion: v1
 clusters:
 - cluster:
@@ -451,250 +573,25 @@ class KubectlHandler:
         except Exception as e:
             logger.error(f"Failed to setup CS client: {e}")
 
-    def is_write_command(self, command: str) -> tuple[bool, Optional[str]]:
-        """检查是否为可写命令
-        所有kubectl command operations: https://kubernetes.io/docs/reference/kubectl/
-
-        Args:
-            command: kubectl 命令字符串
-
-        Returns:
-            (是否为可写命令, 错误信息)
-        """
-        # 定义只读命令列表
-        readonly_commands = {
-            "api-resources",
-            "api-versions", 
-            "cluster-info",
-            "describe",
-            "diff",
-            "events",
-            "explain",
-            "get",
-            "kustomize",
-            "logs",
-            "options",
-            "top",
-            "version"
-        }
-        
-        # 提取命令的第一个参数（主命令）
-        command_parts = command.strip().split()
-        if not command_parts:
-            return True, "Empty command not allowed"
-            
-        main_command = command_parts[0]
-        
-        # 检查是否为只读命令
-        if main_command in readonly_commands:
-            return False, None
-        
-        # 所有其他命令都视为写命令
-        return True, f"Write command '{main_command}' not allowed in read-only mode. Only read-only commands are permitted: {', '.join(sorted(readonly_commands))}"
-
-
-
-
-    def is_interactive_command(self, command: str) -> tuple[bool, Optional[str]]:
-        """检查是否为交互式 kubectl 命令
-
-        Args:
-            command: kubectl 命令字符串
-
-        Returns:
-            (是否为交互式命令, 错误信息)
-        """
-        is_interactive = " -it" in command
-        is_port_forward = "port-forward " in command
-        is_edit = "edit " in command
-
-        if is_interactive:
-            return True, "interactive mode not supported (commands with -it flag), please use non-interactive commands"
-        if is_port_forward:
-            return True, "interactive mode not supported for kubectl port-forward, please use service types like NodePort or LoadBalancer"
-        if is_edit:
-            return True, "interactive mode not supported for kubectl edit, please use 'kubectl get -o yaml', 'kubectl patch', or 'kubectl apply'"
-
-        return False, None
-
-    def is_streaming_command(self, command: str) -> tuple[bool, Optional[str]]:
-        """检查是否为流式命令
-
-        Args:
-            command: kubectl 命令字符串
-
-        Returns:
-            (是否为流式命令, 流式类型)
-        """
-        is_watch = " get " in command and " -w" in command
-        is_logs = " logs " in command and " -f" in command
-        is_attach = " attach " in command
-
-        if is_watch:
-            return True, "watch"
-        if is_logs:
-            return True, "logs"
-        if is_attach:
-            return True, "attach"
-
-        return False, None
-
-    def run_streaming_command(self, command: str, kubeconfig_path: str, timeout: int, execution_log: ExecutionLog) -> Dict[str, Any]:
-        """运行流式命令，支持超时控制"""
-        try:
-            full_command = f"kubectl --kubeconfig {kubeconfig_path} {command}"
-            
-            cmd_start = int(time.time() * 1000)
-            process = subprocess.Popen(
-                full_command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-
-            stdout_lines = []
-            stderr_lines = []
-            process_terminated = False
-
-            def read_stdout():
-                try:
-                    for line in iter(process.stdout.readline, ''):
-                        if line and not process_terminated:
-                            stdout_lines.append(line)
-                except Exception:
-                    pass
-
-            def read_stderr():
-                try:
-                    for line in iter(process.stderr.readline, ''):
-                        if line and not process_terminated:
-                            stderr_lines.append(line)
-                except Exception:
-                    pass
-
-            import threading
-            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-
-            stdout_thread.start()
-            stderr_thread.start()
-
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process_terminated = True
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1)
-
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
-
-            cmd_duration = int(time.time() * 1000) - cmd_start
-            exit_code = process.returncode
-            if process_terminated and exit_code is None:
-                exit_code = 124
-            
-            # Log kubectl execution
-            execution_log.api_calls.append({
-                "api": "KubectlCommand",
-                "command": command,
-                "type": "streaming",
-                "duration_ms": cmd_duration,
-                "exit_code": exit_code or 0,
-                "status": "success" if exit_code == 0 else "failed",
-                "timeout": timeout
-            })
-
-            return {
-                "exit_code": exit_code or 0,
-                "stdout": "".join(stdout_lines),
-                "stderr": "".join(stderr_lines)
-            }
-
-        except Exception as e:
-            execution_log.api_calls.append({
-                "api": "KubectlCommand",
-                "command": command,
-                "type": "streaming",
-                "status": "failed",
-                "error": str(e)
-            })
-            return {
-                "exit_code": 1,
-                "stdout": "",
-                "stderr": str(e)
-            }
-
     def run_command(self, command: str, kubeconfig_path: str, timeout: int, execution_log: ExecutionLog) -> Dict[str, Any]:
-        """Run a kubectl command and return structured result."""
         try:
-            full_command = f"kubectl --kubeconfig {kubeconfig_path} {command}"
-            
-            cmd_start = int(time.time() * 1000)
-            result = subprocess.run(
-                full_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=timeout
-            )
-            cmd_duration = int(time.time() * 1000) - cmd_start
-            
-            # Log kubectl execution
-            execution_log.api_calls.append({
-                "api": "KubectlCommand",
-                "command": command,
-                "type": "normal",
-                "duration_ms": cmd_duration,
-                "exit_code": result.returncode,
-                "status": "success",
-                "timeout": timeout
-            })
-            
-            return {
-                "exit_code": result.returncode,
-                "stdout": result.stdout.strip() if result.stdout else "",
-                "stderr": result.stderr.strip() if result.stderr else "",
-            }
-        except subprocess.TimeoutExpired:
-            cmd_duration = int(time.time() * 1000) - cmd_start
-            execution_log.api_calls.append({
-                "api": "KubectlCommand",
-                "command": command,
-                "type": "normal",
-                "duration_ms": cmd_duration,
-                "exit_code": 124,
-                "status": "timeout",
-                "timeout": timeout
-            })
-            return {
-                "exit_code": 124,
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout} seconds",
-            }
-        except subprocess.CalledProcessError as e:
-            cmd_duration = int(time.time() * 1000) - cmd_start
-            execution_log.api_calls.append({
-                "api": "KubectlCommand",
-                "command": command,
-                "type": "normal",
-                "duration_ms": cmd_duration,
-                "exit_code": e.returncode,
-                "status": "failed"
-            })
-            return {
-                "exit_code": e.returncode,
-                "stdout": e.stdout.strip() if e.stdout else "",
-                "stderr": e.stderr.strip() if e.stderr else str(e),
-            }
+            tokens = shlex.split(command.strip())
+        except ValueError:
+            return {"exit_code": 1, "stdout": "", "stderr": "Invalid command syntax (unbalanced quotes or malformed input)"}
+        cmd_start = int(time.time() * 1000)
+        kubectl = KubectlRunner(kubeconfig_path, timeout, self.allow_write)
+        result = kubectl.run(*tokens)
+        cmd_duration = int(time.time() * 1000) - cmd_start
+        execution_log.api_calls.append({
+            "api": "KubectlCommand",
+            "command": command,
+            "type": "normal",
+            "duration_ms": cmd_duration,
+            "exit_code": result["exit_code"],
+            "status": "success" if result["exit_code"] == 0 else "failed",
+            "timeout": timeout
+        })
+        return result
 
     def _register_tools(self):
         """Register kubectl tool."""
@@ -757,59 +654,32 @@ assistant: exec my-pod -- /bin/sh -c "your command here"""
                 start_time=datetime.utcnow().isoformat() + "Z"
             )
 
+            if not _CLUSTER_ID_PATTERN.match(cluster_id):
+                error_msg = f"Invalid cluster_id format: {cluster_id}"
+                execution_log.error = error_msg
+                execution_log.end_time = datetime.utcnow().isoformat() + "Z"
+                execution_log.duration_ms = int(time.time() * 1000) - start_ms
+                execution_log.metadata = {
+                    "error_type": "InvalidClusterId",
+                    "cluster_id": cluster_id
+                }
+                return KubectlOutput(
+                    command=command,
+                    stdout="",
+                    stderr=error_msg,
+                    exit_code=1,
+                    execution_log=execution_log
+                )
+
             try:
                 # 设置CS客户端
                 self._setup_cs_client(ctx)
-
-                # 检查是否为只读模式
-                if not self.allow_write:
-                    is_write_command, not_allow_write_error = self.is_write_command(command)
-                    if is_write_command:
-                        execution_log.error = not_allow_write_error
-                        execution_log.end_time = datetime.utcnow().isoformat() + "Z"
-                        execution_log.duration_ms = int(time.time() * 1000) - start_ms
-                        execution_log.metadata = {
-                            "error_type": "WriteCommandNotAllowed",
-                            "command": command,
-                            "allow_write": False
-                        }
-                        return KubectlOutput(
-                            command=command,
-                            stdout="",
-                            stderr=not_allow_write_error,
-                            exit_code=1,
-                            execution_log=execution_log
-                        )
-
-                # 检查是否为交互式命令
-                is_interactive, interactive_error = self.is_interactive_command(command)
-                if is_interactive:
-                    execution_log.error = interactive_error
-                    execution_log.end_time = datetime.utcnow().isoformat() + "Z"
-                    execution_log.duration_ms = int(time.time() * 1000) - start_ms
-                    execution_log.metadata = {
-                        "error_type": "InteractiveCommandNotSupported",
-                        "command": command
-                    }
-                    return KubectlOutput(
-                        command=command,
-                        stdout="",
-                        stderr=interactive_error,
-                        exit_code=1,
-                        execution_log=execution_log
-                    )
 
                 # 获取 kubeconfig 文件路径
                 context_manager = get_context_manager()
                 kubeconfig_path = context_manager.get_kubeconfig_path(cluster_id, self.settings.get("kubeconfig_mode"), self.settings.get("kubeconfig_path"), execution_log)
 
-                # 检查是否为流式命令
-                is_streaming, stream_type = self.is_streaming_command(command)
-
-                if is_streaming:
-                    result = self.run_streaming_command(command, kubeconfig_path, self.kubectl_timeout, execution_log)
-                else:
-                    result = self.run_command(command, kubeconfig_path, self.kubectl_timeout, execution_log)
+                result = self.run_command(command, kubeconfig_path, self.kubectl_timeout, execution_log)
 
                 execution_log.end_time = datetime.utcnow().isoformat() + "Z"
                 execution_log.duration_ms = int(time.time() * 1000) - start_ms

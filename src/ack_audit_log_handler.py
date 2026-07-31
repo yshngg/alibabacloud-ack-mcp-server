@@ -27,6 +27,11 @@ except ImportError:
     )
 
 
+def escape_sls_query_value(value: str) -> str:
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"').replace('|', '\\|')
+    return f'"{escaped}"'
+
+
 def _get_sls_client(ctx: Context, region_id: str):
     """从 lifespan providers 中获取指定区域的 SLS 客户端（统一入参: region_id, config）。"""
     lifespan_context = getattr(ctx.request_context, "lifespan_context", {}) or {}
@@ -67,7 +72,7 @@ class ACKAuditLogHandler:
         self.settings = settings or {}
         self.cs_client = None
         self.sls_client = None
-        self.allow_write = settings.get("allow_write", True) if settings else True
+        self.allow_write = settings.get("allow_write", False) if settings else False
         self.resource_mapping = {
             "pod": "pods",
             "deployment": "deployments",
@@ -567,24 +572,27 @@ class ACKAuditLogHandler:
             return datetime.now()
             
         # 相对时间格式
-        if time_str.endswith('h'):
-            return datetime.now() - timedelta(hours=int(time_str[:-1]))
-        elif time_str.endswith('d'):
-            return datetime.now() - timedelta(days=int(time_str[:-1]))
-        elif time_str.endswith('m'):
-            return datetime.now() - timedelta(minutes=int(time_str[:-1]))
-        elif time_str.endswith('s'):
-            return datetime.now() - timedelta(seconds=int(time_str[:-1]))
-        elif time_str.endswith('w'):
-            return datetime.now() - timedelta(weeks=int(time_str[:-1]))
-        else:
-            # ISO 8601格式
-            try:
-                if time_str.endswith('Z'):
-                    time_str = time_str.replace('Z', '+00:00')
-                return datetime.fromisoformat(time_str)
-            except ValueError:
-                return datetime.now() - timedelta(hours=default_hours)
+        try:
+            if time_str.endswith('h'):
+                return datetime.now() - timedelta(hours=int(time_str[:-1]))
+            elif time_str.endswith('d'):
+                return datetime.now() - timedelta(days=int(time_str[:-1]))
+            elif time_str.endswith('m'):
+                return datetime.now() - timedelta(minutes=int(time_str[:-1]))
+            elif time_str.endswith('s'):
+                return datetime.now() - timedelta(seconds=int(time_str[:-1]))
+            elif time_str.endswith('w'):
+                return datetime.now() - timedelta(weeks=int(time_str[:-1]))
+        except (ValueError, OverflowError):
+            return datetime.now() - timedelta(hours=default_hours)
+        
+        # ISO 8601格式
+        try:
+            if time_str.endswith('Z'):
+                time_str = time_str.replace('Z', '+00:00')
+            return datetime.fromisoformat(time_str)
+        except ValueError:
+            return datetime.now() - timedelta(hours=default_hours)
 
     def _parse_time_params(self, params: Dict[str, Any]) -> tuple[int, int]:
         """解析时间参数为Unix时间戳"""
@@ -748,21 +756,21 @@ class ACKAuditLogHandler:
         query = "*"
 
         if params.get("user") and params["user"] != "*":
-            query += f" and user.username: {params['user']}"
+            query += f" and user.username: {escape_sls_query_value(params['user'])}"
 
         if params.get("namespace") and params["namespace"] != "*":
-            query += f" and objectRef.namespace: {params['namespace']}"
+            query += f" and objectRef.namespace: {escape_sls_query_value(params['namespace'])}"
 
         if params.get("verbs") and len(params["verbs"]) > 0:
-            verbs = [f"verb: \"{verb}\"" for verb in params["verbs"]]
+            verbs = [f"verb: {escape_sls_query_value(str(verb))}" for verb in params["verbs"]]
             query += f" and ({' or '.join(verbs)})"
 
         if params.get("resource_types") and len(params["resource_types"]) > 0:
-            resource_types = [f"objectRef.resource: \"{rt}\"" for rt in params["resource_types"]]
+            resource_types = [f"objectRef.resource: {escape_sls_query_value(str(rt))}" for rt in params["resource_types"]]
             query += f" and ({' or '.join(resource_types)})"
 
         if params.get("resource_name") and params["resource_name"] != "*":
-            query += f" and objectRef.name: {params['resource_name']}"
+            query += f" and objectRef.name: {escape_sls_query_value(params['resource_name'])}"
 
         return query
 

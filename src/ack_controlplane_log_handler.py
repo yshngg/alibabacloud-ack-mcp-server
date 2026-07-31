@@ -19,6 +19,7 @@ from models import (
     ExecutionLog,
     enable_execution_log_ctx
 )
+from ack_audit_log_handler import escape_sls_query_value
 
 
 def _get_sls_client(ctx: Context, region_id: str):
@@ -70,16 +71,19 @@ def _parse_single_time(time_str: Optional[str], default_hours: int = 24) -> date
         return datetime.fromtimestamp(iv)
 
     ts_lower = ts.lower()
-    if ts_lower.endswith('h'):
-        return datetime.now() - timedelta(hours=int(ts_lower[:-1]))
-    if ts_lower.endswith('d'):
-        return datetime.now() - timedelta(days=int(ts_lower[:-1]))
-    if ts_lower.endswith('m'):
-        return datetime.now() - timedelta(minutes=int(ts_lower[:-1]))
-    if ts_lower.endswith('s'):
-        return datetime.now() - timedelta(seconds=int(ts_lower[:-1]))
-    if ts_lower.endswith('w'):
-        return datetime.now() - timedelta(weeks=int(ts_lower[:-1]))
+    try:
+        if ts_lower.endswith('h'):
+            return datetime.now() - timedelta(hours=int(ts_lower[:-1]))
+        if ts_lower.endswith('d'):
+            return datetime.now() - timedelta(days=int(ts_lower[:-1]))
+        if ts_lower.endswith('m'):
+            return datetime.now() - timedelta(minutes=int(ts_lower[:-1]))
+        if ts_lower.endswith('s'):
+            return datetime.now() - timedelta(seconds=int(ts_lower[:-1]))
+        if ts_lower.endswith('w'):
+            return datetime.now() - timedelta(weeks=int(ts_lower[:-1]))
+    except (ValueError, OverflowError):
+        return datetime.now() - timedelta(hours=default_hours)
 
     try:
         iso_str = ts
@@ -110,8 +114,8 @@ def _build_controlplane_log_query(
         return isinstance(value, str) and not hasattr(value, 'annotation')
 
     # 额外过滤条件
-    if is_valid_string(filter_pattern):
-        conditions.append(filter_pattern)
+    if is_valid_string(filter_pattern) and filter_pattern.strip():
+        conditions.append(escape_sls_query_value(filter_pattern.strip()))
 
     return ' AND '.join(conditions) if conditions else '*'
 
@@ -220,7 +224,7 @@ class ACKControlPlaneLogHandler:
             settings: Configuration settings
         """
         self.settings = settings or {}
-        self.allow_write = settings.get("allow_write", True) if settings else True
+        self.allow_write = settings.get("allow_write", False) if settings else False
 
         # Per-handler toggle
         self.enable_execution_log = self.settings.get("enable_execution_log", False)

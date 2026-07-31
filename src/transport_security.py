@@ -41,14 +41,17 @@ class TransportSecurityMiddleware(Middleware):
     """Middleware to enforce DNS rebinding protection for MCP transport endpoints."""
 
     def __init__(self, settings: TransportSecuritySettings | None = None):
-        # If not specified, disable DNS rebinding protection by default
-        # for backwards compatibility
-        self.settings = settings or TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        self.settings = settings or TransportSecuritySettings(enable_dns_rebinding_protection=True)
 
     def _validate_origin(self, origin: str | None) -> bool:
         """Validate the Origin header against allowed values."""
-        # Origin can be absent for same-origin requests
         if not origin:
+            if self.settings.allowed_origins:
+                logger.warning("Missing Origin header when allowed_origins is configured")
+                return False
+            return True
+
+        if not self.settings.allowed_origins:
             return True
 
         # Check exact match first
@@ -58,13 +61,32 @@ class TransportSecurityMiddleware(Middleware):
         # Check wildcard port patterns
         for allowed in self.settings.allowed_origins:
             if allowed.endswith(":*"):
-                # Extract base origin from pattern
                 base_origin = allowed[:-2]
-                # Check if the actual origin starts with base origin and has a port
-                if origin.startswith(base_origin + ":"):
+                scheme_host, _, port_part = origin.rpartition(":")
+                if scheme_host == base_origin and port_part.isdigit():
                     return True
 
         logger.warning(f"Invalid Origin header: {origin}")
+        return False
+
+    def _validate_host(self, host: str | None) -> bool:
+        """Validate the Host header against allowed values."""
+        if not host:
+            if self.settings.allowed_hosts:
+                logger.warning("Missing Host header when allowed_hosts is configured")
+                return False
+            return True
+        if not self.settings.allowed_hosts:
+            return True
+        if host in self.settings.allowed_hosts:
+            return True
+        for allowed in self.settings.allowed_hosts:
+            if allowed.endswith(":*"):
+                base = allowed[:-2]
+                host_part, _, port_part = host.rpartition(":")
+                if host_part == base and port_part.isdigit():
+                    return True
+        logger.warning(f"Invalid Host header: {host}")
         return False
 
     async def validate_request(self, request: Request) -> str | None:
@@ -80,6 +102,11 @@ class TransportSecurityMiddleware(Middleware):
         origin = request.headers.get("origin")
         if not self._validate_origin(origin):
             return "Invalid Origin header"
+
+        # Validate Host header
+        host = request.headers.get("host")
+        if not self._validate_host(host):
+            return "Invalid Host header"
 
         return None
 

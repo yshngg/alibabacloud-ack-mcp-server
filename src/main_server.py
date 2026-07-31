@@ -20,6 +20,7 @@ to connect various sub-MCP servers.
 """
 
 import argparse
+import json
 import os
 import sys
 from typing import Dict, Any, Optional, Literal
@@ -204,8 +205,8 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="localhost",
-        help="Host for SSE transport (default: localhost)"
+        default="127.0.0.1",
+        help="Host for SSE transport (default: 127.0.0.1)"
     )
     parser.add_argument(
         "--port",
@@ -223,12 +224,17 @@ def main():
     parser.add_argument(
         "--access-key-id",
         type=str,
-        help="AlibabaCloud Access Key ID (default: from env ACCESS_KEY_ID)"
+        help="[DEPRECATED] AlibabaCloud Access Key ID (default: from env ACCESS_KEY_ID). Use --access-key-file or environment variables instead."
     )
     parser.add_argument(
         "--access-key-secret",
         type=str,
-        help="AlibabaCloud Access Key Secret (default: from env ACCESS_KEY_SECRET)"
+        help="[DEPRECATED] AlibabaCloud Access Key Secret (default: from env ACCESS_KEY_SECRET). Use --access-key-file or environment variables instead."
+    )
+    parser.add_argument(
+        "--access-key-file",
+        type=str,
+        help="Path to JSON file containing access credentials: {'access_key_id': '...', 'access_key_secret': '...'}"
     )
     parser.add_argument(
         "--kubeconfig-mode",
@@ -273,6 +279,83 @@ def main():
     )
     
     args = parser.parse_args()
+
+    if args.access_key_secret or args.access_key_id:
+        logger.warning(
+            "DEPRECATED: --access-key-id and --access-key-secret CLI flags are deprecated. "
+            "Use --access-key-file or environment variables (ACCESS_KEY_ID, ACCESS_KEY_SECRET) instead. "
+            "CLI credentials are visible in process listings (ps aux)."
+        )
+    # NOTE: sys.argv reassignment does not hide credentials from /proc/PID/cmdline on Linux.
+    sys.argv = [sys.argv[0]]
+
+    access_key_id = os.getenv("ACCESS_KEY_ID")
+    access_key_secret = os.getenv("ACCESS_KEY_SECRET")
+
+    if args.access_key_file:
+        try:
+            fd = os.open(args.access_key_file, os.O_RDONLY)
+            file_mode = os.fstat(fd).st_mode
+            if file_mode & 0o077:
+                logger.error(
+                    f"Access key file {args.access_key_file} is group/world accessible. "
+                    f"Please restrict permissions (e.g., chmod 600)."
+                )
+                os.close(fd)
+                sys.exit(1)
+            with os.fdopen(fd, 'r') as f:
+                creds = json.load(f)
+            if not isinstance(creds, dict):
+                logger.error(f"Access key file {args.access_key_file} must contain a JSON object")
+                sys.exit(1)
+            file_ak = creds.get("access_key_id")
+            file_sk = creds.get("access_key_secret")
+            if file_ak is not None and not isinstance(file_ak, str):
+                logger.error(f"Access key file {args.access_key_file}: 'access_key_id' must be a string")
+                sys.exit(1)
+            if file_sk is not None and not isinstance(file_sk, str):
+                logger.error(f"Access key file {args.access_key_file}: 'access_key_secret' must be a string")
+                sys.exit(1)
+            access_key_id = access_key_id or file_ak
+            access_key_secret = access_key_secret or file_sk
+            if not file_ak and not file_sk:
+                logger.error(
+                    f"Access key file {args.access_key_file} does not contain "
+                    f"'access_key_id' or 'access_key_secret'"
+                )
+                sys.exit(1)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read access key file {args.access_key_file}: {e}")
+            sys.exit(1)
+
+    access_key_id = access_key_id or args.access_key_id
+    access_key_secret = access_key_secret or args.access_key_secret
+
+    if args.port < 1 or args.port > 65535:
+        logger.error(f"Invalid port: {args.port}. Must be between 1 and 65535.")
+        sys.exit(1)
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            logger.warning(f"{name} is not a valid integer, using default of {default}")
+            return default
+
+    kubectl_timeout = _env_int("KUBECTL_TIMEOUT", 30)
+    if kubectl_timeout < 5:
+        logger.warning(f"KUBECTL_TIMEOUT={kubectl_timeout} is too low, using minimum value of 5")
+        kubectl_timeout = 5
+
+    cache_ttl = _env_int("CACHE_TTL", 300)
+    if cache_ttl < 60:
+        logger.warning(f"CACHE_TTL={cache_ttl} is too low, using minimum value of 60")
+        cache_ttl = 60
+
+    cache_max_size = _env_int("CACHE_MAX_SIZE", 1000)
+    if cache_max_size < 1:
+        logger.warning(f"CACHE_MAX_SIZE={cache_max_size} is too low, using minimum value of 1")
+        cache_max_size = 1
     
     # Configure logging
     logger.remove()
@@ -291,28 +374,28 @@ def main():
         
         # 阿里云认证配置
         "region_id": args.region or os.getenv("REGION_ID", "cn-hangzhou"),
-        "access_key_id": args.access_key_id or os.getenv("ACCESS_KEY_ID"),
-        "access_key_secret": args.access_key_secret or os.getenv("ACCESS_KEY_SECRET"),
+        "access_key_id": access_key_id,
+        "access_key_secret": access_key_secret,
 
         # 审计日志配置
         "audit_config_path": args.audit_config,
         "audit_config_dict": None,
         
         # 额外的环境配置
-        "cache_ttl": int(os.getenv("CACHE_TTL", "300")),
-        "cache_max_size": int(os.getenv("CACHE_MAX_SIZE", "1000")),
+        "cache_ttl": cache_ttl,
+        "cache_max_size": cache_max_size,
         "fastmcp_log_level": os.getenv("FASTMCP_LOG_LEVEL", "INFO"),
         "development": os.getenv("DEVELOPMENT", "false").lower() == "true",
         
         # 超时配置
-        "diagnose_timeout": int(os.getenv("DIAGNOSE_TIMEOUT", "600")),  # 诊断超时时间（秒）
-        "diagnose_poll_interval": int(os.getenv("DIAGNOSE_POLL_INTERVAL", "15")),  # 诊断轮询间隔（秒）
-        "kubectl_timeout": int(os.getenv("KUBECTL_TIMEOUT", "30")),  # kubectl命令超时（秒）
-        "api_timeout": int(os.getenv("API_TIMEOUT", "60")),  # API调用超时（秒）
+        "diagnose_timeout": _env_int("DIAGNOSE_TIMEOUT", 600),  # 诊断超时时间（秒）
+        "diagnose_poll_interval": _env_int("DIAGNOSE_POLL_INTERVAL", 15),  # 诊断轮询间隔（秒）
+        "kubectl_timeout": kubectl_timeout,  # kubectl命令超时（秒）
+        "api_timeout": _env_int("API_TIMEOUT", 60),  # API调用超时（秒）
         
         # 兼容性配置
-        "access_secret_key": args.access_key_secret or os.getenv("ACCESS_KEY_SECRET"),  # 兼容旧字段名
-        "original_settings": Configs(vars(args)),
+        "access_secret_key": access_key_secret,  # 兼容旧字段名
+        "original_settings": Configs({k: v for k, v in vars(args).items() if k not in ("access_key_id", "access_key_secret")}),
 
         # ACK kubectl 配置
         "kubeconfig_mode": args.kubeconfig_mode or os.getenv("KUBECONFIG_MODE", "ACK_PUBLIC"),
@@ -320,8 +403,14 @@ def main():
         
         # Prometheus 配置
         "prometheus_endpoint_mode": args.prometheus_endpoint_mode or os.getenv("PROMETHEUS_ENDPOINT_MODE", "ARMS_PUBLIC"),
-    }
-    
+}
+
+    if args.transport in ("http", "sse") and args.host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            f"Binding to non-loopback address {args.host} without authentication configured. "
+            f"This exposes the server to the network. Use --allowed-origins to restrict access."
+        )
+
     # 验证必要的配置
     if not settings_dict.get("access_key_id"):
         logger.warning("⚠️  未配置ACCESS_KEY_ID，部分功能可能无法使用")

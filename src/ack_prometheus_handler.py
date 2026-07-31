@@ -27,7 +27,7 @@ class PrometheusHandler:
         # prometheus_endpoint_mode: "ARMS_PUBLIC" (default), "ARMS_PRIVATE", or "LOCAL"
         self.prometheus_endpoint_mode = self.settings.get("prometheus_endpoint_mode", "ARMS_PUBLIC")
 
-        self.allow_write = self.settings.get("allow_write", True)
+        self.allow_write = self.settings.get("allow_write", False)
 
         # Per-handler toggle
         self.enable_execution_log = self.settings.get("enable_execution_log", False)
@@ -256,6 +256,27 @@ class PrometheusHandler:
         )
         
         try:
+            promql = (promql or "").strip()
+            if not promql:
+                error_msg = "promql parameter is required and cannot be empty"
+            elif len(promql) > 10000:
+                error_msg = "promql parameter exceeds maximum length of 10000 characters"
+            else:
+                error_msg = None
+
+            if error_msg:
+                execution_log.error = error_msg
+                execution_log.end_time = datetime.utcnow().isoformat() + "Z"
+                execution_log.duration_ms = int(time.time() * 1000) - start_ms
+                execution_log.metadata = {
+                    "error_type": "InvalidPromQL",
+                    "failure_stage": "validate_promql"
+                }
+                return {
+                    "error": ErrorModel(error_code="InvalidPromQL", error_message=error_msg).model_dump(),
+                    "execution_log": execution_log
+                }
+
             endpoint = self._resolve_prometheus_endpoint(ctx, cluster_id, execution_log)
             if not endpoint:
                 error_msg = "无法获取 Prometheus HTTP API，请确定此集群是否已经正常部署阿里云Prometheus 或 环境变量 PROMETHEUS_HTTP_API[_<cluster_id>]"

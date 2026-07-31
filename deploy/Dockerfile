@@ -14,9 +14,6 @@ WORKDIR /app
 # Copy dependency definition files
 COPY requirements.txt pyproject.toml ./
 
-# Copy the application source code
-COPY ./* ./
-
 # Install dependencies using requirements.txt
 # This leverages Docker's layer caching, so dependencies are only re-installed
 # if the requirements.txt changes.
@@ -34,7 +31,7 @@ ARG TARGETARCH
 # Set working directory
 WORKDIR /app
 # Copy the application source code
-COPY ./* ./
+COPY src/ ./src/
 
 # Copy installed dependencies from the builder stage
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
@@ -91,7 +88,8 @@ EXPOSE 8000
 # Default to localhost binding for security. Override with --host flag for network access.
 # For production deployments requiring network access, use --host 0.0.0.0 with proper
 # authentication and Origin validation (--allowed-origins).
-CMD ["python", "-m", "main_server", "--transport", "http", "--allow-write", "--host", "127.0.0.1", "--port", "8000"]
+CMD ["python", "-m", "main_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8000"]
 
 # how to run
-# docker run -e ACCESS_KEY_ID=<your-access-key-id> -e ACCESS_KEY_SECRET=<your-access-key-secret> -p 8000:8000 ack-mcp-server:1.0 python -m main_server --transport http --allow-write --host 0.0.0.0 --port 8000
+# docker run -e ACCESS_KEY_ID=<your-access-key-id> -e ACCESS_KEY_SECRET=<your-access-key-secret> -p 8000:8000 ack-mcp-server:1.0 python -m main_server --transport http --host 0.0.0.0 --port 8000 --allowed-origins <your-allowed-origin>
+# Add --allow-write flag if mutating operations (create/update/delete) are needed

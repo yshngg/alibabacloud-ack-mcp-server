@@ -1,17 +1,16 @@
 """ACK Autoscaling Handler - Autoscaling and workload elasticity analysis."""
 
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass
 import json
-import subprocess
+import math
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
+import httpx
 from fastmcp import FastMCP, Context
 from loguru import logger
 from pydantic import Field
-import httpx
-import time
-import math
-from datetime import datetime
 
 from models import (
     WorkloadAutoscalingAnalysisOutput,
@@ -20,6 +19,12 @@ from models import (
     ErrorModel,
     ExecutionLog,
     enable_execution_log_ctx,
+)
+from kubectl_handler import (
+    KubectlRunner,
+    validate_kubeconfig_path,
+    validate_kubernetes_name,
+    validate_workload_type,
 )
 
 # 波动性分析参数配置
@@ -244,19 +249,15 @@ class ACKAutoscalingHandler:
                 execution_log,
             )
 
-            command = (
-                f"kubectl --kubeconfig {kubeconfig_path} "
-                f"get {workload_type} {workload_name} -n {namespace} -o json"
-            )
+            namespace = validate_kubernetes_name(namespace, "namespace")
+            workload_type = validate_workload_type(workload_type)
+            workload_name = validate_kubernetes_name(workload_name, "workload_name")
+            kubeconfig_path = validate_kubeconfig_path(kubeconfig_path)
+
+            kubectl = KubectlRunner(kubeconfig_path, self.kubectl_timeout)
 
             cmd_start = int(time.time() * 1000)
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.kubectl_timeout,
-            )
+            result = kubectl.run("get", workload_type, workload_name, "-n", namespace, "-o", "json")
             cmd_duration = int(time.time() * 1000) - cmd_start
 
             execution_log.api_calls.append(
@@ -264,14 +265,14 @@ class ACKAutoscalingHandler:
                     "api": "KubectlPrecheckWorkload",
                     "command": f"get {workload_type} {workload_name} -n {namespace} -o json",
                     "duration_ms": cmd_duration,
-                    "exit_code": result.returncode,
-                    "status": "success" if result.returncode == 0 else "failed",
+                    "exit_code": result["exit_code"],
+                    "status": "success" if result["exit_code"] == 0 else "failed",
                 }
             )
 
-            if result.returncode != 0:
+            if result["exit_code"] != 0:
                 execution_log.warnings.append(
-                    f"Precheck: kubectl failed to get workload spec/status: {result.stderr}"
+                    f"Precheck: kubectl failed to get workload spec/status: {result["stderr"]}"
                 )
                 return WorkloadPrecheckResult(
                     stable_for_hpa=False,
@@ -280,7 +281,7 @@ class ACKAutoscalingHandler:
                     ready_ratio=0.0,
                 )
 
-            workload_json = json.loads(result.stdout)
+            workload_json = json.loads(result["stdout"])
             spec = workload_json.get("spec", {}) or {}
             status = workload_json.get("status", {}) or {}
 
@@ -338,16 +339,6 @@ class ACKAutoscalingHandler:
                 message=message,
             )
 
-        except subprocess.TimeoutExpired:
-            execution_log.warnings.append(
-                "Precheck: timeout while querying workload via kubectl"
-            )
-            return WorkloadPrecheckResult(
-                stable_for_hpa=False,
-                replicas=0,
-                ready_replicas=0,
-                ready_ratio=0.0,
-            )
         except json.JSONDecodeError as e:
             execution_log.warnings.append(
                 f"Precheck: failed to parse workload JSON: {str(e)}"
@@ -860,33 +851,32 @@ class ACKAutoscalingHandler:
                 execution_log
             )
 
-            command = f"kubectl --kubeconfig {kubeconfig_path} get {workload_type} {workload_name} -n {namespace} -o json"
-            
+            namespace = validate_kubernetes_name(namespace, "namespace")
+            workload_type = validate_workload_type(workload_type)
+            workload_name = validate_kubernetes_name(workload_name, "workload_name")
+            kubeconfig_path = validate_kubeconfig_path(kubeconfig_path)
+
+            kubectl = KubectlRunner(kubeconfig_path, self.kubectl_timeout)
+
             cmd_start = int(time.time() * 1000)
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.kubectl_timeout
-            )
+            result = kubectl.run("get", workload_type, workload_name, "-n", namespace, "-o", "json")
             cmd_duration = int(time.time() * 1000) - cmd_start
 
             execution_log.api_calls.append({
                 "api": "KubectlGetWorkload",
                 "command": f"get {workload_type} {workload_name} -n {namespace} -o json",
                 "duration_ms": cmd_duration,
-                "exit_code": result.returncode,
-                "status": "success" if result.returncode == 0 else "failed",
+                "exit_code": result["exit_code"],
+                "status": "success" if result["exit_code"] == 0 else "failed",
             })
 
-            if result.returncode != 0:
+            if result["exit_code"] != 0:
                 execution_log.warnings.append(
-                    f"{resource_type} kubectl 查询 workload 失败: {result.stderr}"
+                    f"{resource_type} kubectl 查询 workload 失败: {result["stderr"]}"
                 )
                 return None
 
-            workload_json = json.loads(result.stdout)
+            workload_json = json.loads(result["stdout"])
             containers = workload_json.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
             
             if not containers:
@@ -922,9 +912,6 @@ class ACKAutoscalingHandler:
             execution_log.warnings.append(f"No request value configured for {resource_type} in workload")
             return None
 
-        except subprocess.TimeoutExpired:
-            execution_log.warnings.append(f"Timeout while querying {resource_type} via kubectl")
-            return None
         except json.JSONDecodeError as e:
             execution_log.warnings.append(f"Failed to parse workload JSON for {resource_type}: {str(e)}")
             return None
